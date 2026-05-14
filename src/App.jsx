@@ -1,19 +1,19 @@
 import { useState, useEffect, useMemo } from 'react'
 
-const STORAGE_KEY = 'verdon-planning-v1'
+const STORAGE_KEY = 'verdon-planning-v2'
 
 const DEFAULT_PARTICIPANTS = [
-  'Alex',
-  'Pote 2',
-  'Pote 3',
-  'Pote 4',
-  'Pote 5',
-  'Pote 6',
-  'Pote 7',
-  'Pote 8',
-  'Pote 9',
-  'Pote 10',
-].map((name, i) => ({ id: `p${i + 1}`, name }))
+  { id: 'p1', name: 'Alex Shk', note: 'Organisateur', notInDays: [] },
+  { id: 'p2', name: 'Alexis Mazo', note: 'Part avant le vendredi', notInDays: ['d5', 'd6', 'd7'] },
+  { id: 'p3', name: 'Amandine Rocher', note: '', notInDays: [] },
+  { id: 'p4', name: 'Arnaud Drevet', note: '', notInDays: [] },
+  { id: 'p5', name: 'Caroline Lem', note: '', notInDays: [] },
+  { id: 'p6', name: 'Catherine Xiong', note: '', notInDays: [] },
+  { id: 'p7', name: 'Dylan Monfray', note: '', notInDays: [] },
+  { id: 'p8', name: 'Ophélie Martin', note: '', notInDays: [] },
+  { id: 'p9', name: 'Sailor Nath', note: '', notInDays: [] },
+  { id: 'p10', name: 'Sylou LeVigo', note: '', notInDays: [] },
+]
 
 const DEFAULT_DAYS = [
   {
@@ -207,6 +207,11 @@ function loadState() {
     merged.activities = (merged.activities || []).map(a => {
       const def = DEFAULT_ACTIVITIES.find(d => d.id === a.id)
       return def ? { ...a, options: def.options } : a
+    })
+    // Réinjecter note + notInDays par id (système).
+    merged.participants = (merged.participants || []).map(p => {
+      const def = DEFAULT_PARTICIPANTS.find(d => d.id === p.id)
+      return def ? { ...p, note: def.note, notInDays: def.notInDays } : p
     })
     return merged
   } catch {
@@ -607,6 +612,7 @@ function ParticipantsTab({ state, setState }) {
       participants: s.participants.map(p => p.id === id ? { ...p, name } : p),
     }))
   }
+  const isAbsent = (participant, dayId) => (participant.notInDays || []).includes(dayId)
   const toggleParticipation = (activityId, participantId) => {
     setState(s => {
       const current = s.participation[activityId] || {}
@@ -626,7 +632,7 @@ function ParticipantsTab({ state, setState }) {
     <div className="space-y-6">
       <div className="rounded-xl bg-white shadow-sm border border-slate-200 p-4">
         <h2 className="text-sm font-semibold text-slate-700 mb-3">Les 10 participants</h2>
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           {state.participants.map((p, idx) => (
             <div key={p.id} className="flex items-center gap-2">
               <span className="text-xs text-slate-400 w-5 text-right">{idx + 1}.</span>
@@ -635,6 +641,11 @@ function ParticipantsTab({ state, setState }) {
                 value={p.name}
                 onChange={e => updateParticipant(p.id, e.target.value)}
               />
+              {p.note && (
+                <span className="text-[10px] whitespace-nowrap bg-amber-100 text-amber-800 border border-amber-200 rounded px-1.5 py-0.5">
+                  {p.note}
+                </span>
+              )}
             </div>
           ))}
         </div>
@@ -658,18 +669,25 @@ function ParticipantsTab({ state, setState }) {
               <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                 {state.participants.map(p => {
                   const checked = !!(state.participation[a.id] && state.participation[a.id][p.id])
+                  const absent = isAbsent(p, a.dayId)
                   return (
                     <label
                       key={p.id}
-                      className={`flex items-center gap-2 rounded-md border px-2 py-1.5 cursor-pointer text-sm transition ${
-                        checked ? 'bg-sky-50 border-sky-300' : 'bg-white border-slate-200 hover:bg-slate-50'
+                      className={`flex items-center gap-2 rounded-md border px-2 py-1.5 text-sm transition ${
+                        absent
+                          ? 'bg-slate-50 border-slate-200 text-slate-400 cursor-not-allowed line-through'
+                          : checked
+                            ? 'bg-sky-50 border-sky-300 cursor-pointer'
+                            : 'bg-white border-slate-200 hover:bg-slate-50 cursor-pointer'
                       }`}
+                      title={absent ? 'Pas présent sur ce jour' : ''}
                     >
                       <input
                         type="checkbox"
                         className="accent-sky-600"
-                        checked={checked}
-                        onChange={() => toggleParticipation(a.id, p.id)}
+                        checked={checked && !absent}
+                        disabled={absent}
+                        onChange={() => !absent && toggleParticipation(a.id, p.id)}
                       />
                       <span className="truncate">{p.name}</span>
                     </label>
