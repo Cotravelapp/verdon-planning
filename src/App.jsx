@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { supabase, STATE_ID, CLIENT_ID } from './supabase'
 
 const STORAGE_KEY = 'verdon-planning-v2'
 
@@ -197,25 +198,39 @@ const DEFAULT_STATE = {
   reservations: DEFAULT_RESERVATIONS,
 }
 
-function loadState() {
+function mergeWithDefaults(parsed) {
+  if (!parsed || typeof parsed !== 'object') return DEFAULT_STATE
+  const merged = { ...DEFAULT_STATE, ...parsed }
+  // Toujours réinjecter les `options` (système, pas user-editable) depuis le défaut.
+  merged.activities = (merged.activities || DEFAULT_ACTIVITIES).map(a => {
+    const def = DEFAULT_ACTIVITIES.find(d => d.id === a.id)
+    return def ? { ...a, options: def.options } : a
+  })
+  // Réinjecter note + notInDays par id (système).
+  merged.participants = (merged.participants || DEFAULT_PARTICIPANTS).map(p => {
+    const def = DEFAULT_PARTICIPANTS.find(d => d.id === p.id)
+    return def ? { ...p, note: def.note, notInDays: def.notInDays } : p
+  })
+  return merged
+}
+
+function loadCached() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return DEFAULT_STATE
-    const parsed = JSON.parse(raw)
-    const merged = { ...DEFAULT_STATE, ...parsed }
-    // Toujours réinjecter les `options` (système, pas user-editable) depuis le défaut.
-    merged.activities = (merged.activities || []).map(a => {
-      const def = DEFAULT_ACTIVITIES.find(d => d.id === a.id)
-      return def ? { ...a, options: def.options } : a
-    })
-    // Réinjecter note + notInDays par id (système).
-    merged.participants = (merged.participants || []).map(p => {
-      const def = DEFAULT_PARTICIPANTS.find(d => d.id === p.id)
-      return def ? { ...p, note: def.note, notInDays: def.notInDays } : p
-    })
-    return merged
+    return mergeWithDefaults(JSON.parse(raw))
   } catch {
     return DEFAULT_STATE
+  }
+}
+
+// Strip system-injected fields before saving (they get re-merged at load).
+function stripForSave(state) {
+  return {
+    ...state,
+    activities: state.activities.map(({ options, ...rest }) => rest),
+    participants: state.participants.map(({ note, notInDays, ...rest }) => rest),
+    _lastClientId: CLIENT_ID,
   }
 }
 
@@ -410,6 +425,30 @@ function Field({ label, children }) {
 
 const inputCls =
   'w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-500'
+
+function SyncBadge({ status }) {
+  const config = {
+    loading: { label: 'Connexion…', cls: 'bg-white/15 text-white' },
+    saving: { label: '↻ Sync…', cls: 'bg-white/15 text-white' },
+    synced: { label: '✓ Sync', cls: 'bg-emerald-500/30 text-white' },
+    offline: { label: '⚠ Hors-ligne', cls: 'bg-amber-500/30 text-white' },
+    error: { label: '⚠ Erreur sync', cls: 'bg-rose-500/30 text-white' },
+  }[status] || { label: status, cls: 'bg-white/15 text-white' }
+  return (
+    <span
+      className={`text-[10px] uppercase tracking-wider px-2 py-1 rounded-full ${config.cls}`}
+      title={
+        status === 'synced'
+          ? 'Tes modifs sont enregistrées et visibles par tout le monde'
+          : status === 'offline'
+            ? 'Mode hors-ligne — tes modifs restent locales, elles ne sont pas partagées'
+            : ''
+      }
+    >
+      {config.label}
+    </span>
+  )
+}
 
 function StatusBadge({ status }) {
   return (
@@ -987,15 +1026,85 @@ function ProgrammeTab({ state }) {
 }
 
 export default function App() {
-  const [state, setState] = useState(loadState)
+  const [state, setState] = useState(loadCached)
   const [tab, setTab] = useState('programme')
+  const [syncStatus, setSyncStatus] = useState('loading')
+  const stateRef = useRef(state)
+  stateRef.current = state
+  const saveTimerRef = useRef(null)
+  const initialFetchDoneRef = useRef(false)
 
+  // Fetch initial + subscribe to realtime
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+    let cancelled = false
+    ;(async () => {
+      const { data, error } = await supabase
+        .from('verdon_state')
+        .select('data')
+        .eq('id', STATE_ID)
+        .maybeSingle()
+      if (cancelled) return
+      if (error) {
+        console.warn('[verdon] fetch error', error)
+        setSyncStatus('offline')
+        initialFetchDoneRef.current = true
+        return
+      }
+      const remote = data?.data
+      if (remote && Object.keys(remote).length > 0 && remote.activities) {
+        setState(mergeWithDefaults(remote))
+      } else {
+        // Bootstrap an empty row with our defaults.
+        await supabase
+          .from('verdon_state')
+          .update({ data: stripForSave(stateRef.current), updated_at: new Date().toISOString() })
+          .eq('id', STATE_ID)
+      }
+      initialFetchDoneRef.current = true
+      setSyncStatus('synced')
+    })()
+
+    const channel = supabase
+      .channel('verdon_state_changes')
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'verdon_state', filter: `id=eq.${STATE_ID}` },
+        (payload) => {
+          const remote = payload.new?.data
+          if (!remote) return
+          if (remote._lastClientId === CLIENT_ID) return // own echo, skip
+          setState(mergeWithDefaults(remote))
+        }
+      )
+      .subscribe()
+
+    return () => {
+      cancelled = true
+      supabase.removeChannel(channel)
+    }
+  }, [])
+
+  // Debounced save on state change
+  useEffect(() => {
+    if (!initialFetchDoneRef.current) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+      return
+    }
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = setTimeout(async () => {
+      setSyncStatus('saving')
+      const payload = stripForSave(state)
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+      const { error } = await supabase
+        .from('verdon_state')
+        .update({ data: payload, updated_at: new Date().toISOString() })
+        .eq('id', STATE_ID)
+      setSyncStatus(error ? 'error' : 'synced')
+    }, 400)
   }, [state])
 
   const resetAll = () => {
-    if (confirm('Tout réinitialiser aux valeurs par défaut ?')) {
+    if (confirm('Tout réinitialiser aux valeurs par défaut ? (ça écrase la version partagée pour tout le monde)')) {
       setState(DEFAULT_STATE)
     }
   }
@@ -1008,12 +1117,15 @@ export default function App() {
             <h1 className="text-xl sm:text-2xl font-bold">Séjour Verdon — 15-21 juin 2026</h1>
             <p className="text-xs sm:text-sm text-sky-100 mt-0.5">Villa à Salernes · 10 participants · Gorges du Verdon / Castellane</p>
           </div>
-          <button
-            onClick={resetAll}
-            className="text-[11px] uppercase tracking-wide text-sky-100 hover:text-white underline underline-offset-2"
-          >
-            Réinitialiser
-          </button>
+          <div className="flex items-center gap-3">
+            <SyncBadge status={syncStatus} />
+            <button
+              onClick={resetAll}
+              className="text-[11px] uppercase tracking-wide text-sky-100 hover:text-white underline underline-offset-2"
+            >
+              Réinitialiser
+            </button>
+          </div>
         </div>
       </header>
 
@@ -1045,7 +1157,7 @@ export default function App() {
       </main>
 
       <footer className="max-w-5xl mx-auto px-4 py-6 text-center text-xs text-slate-400">
-        Données stockées localement (localStorage). Aucun serveur.
+        Partagé entre les 10 — toutes les modifs sont sync en temps réel.
       </footer>
     </div>
   )
